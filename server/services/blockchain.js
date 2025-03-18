@@ -232,45 +232,76 @@ const getOrders = async (orderIds) => {
  */
 const getAllOrders = async (maxOrderId = 100) => {
   const orderbook = getInsuranceOrderbook();
+  const insurancePool = getInsurancePool();
   const orders = [];
+  const tokenCache = {}; // Cache for strike price -> token addresses
   
-  // Scan from order ID 1 up to maxOrderId
+  // First, batch fetch all orders
+  const orderPromises = [];
   for (let orderId = 1; orderId <= maxOrderId; orderId++) {
-    try {
-      const order = await orderbook.getOrder(orderId);
-      
-      // If order amount is 0, it's already filled or cancelled
-      if (order[2].toString() === '0') {
-        continue;
-      }
-      
-      const isFillable = await orderbook.isOrderFillable(orderId);
-      
-      // Get token addresses for this strike price
-      const insurancePool = getInsurancePool();
-      const [collateralTokenAddr, claimTokenAddr] = await insurancePool.getInsuranceTokens(order[1]);
-      
-      // Format order data
-      orders.push({
-        orderId,
-        maker: order[0],
-        strikePrice: order[1].toString(),
-        strikePriceFormatted: ethers.formatUnits(order[1], 18),
-        amount: order[2].toString(),
-        amountFormatted: ethers.formatUnits(order[2], 18),
-        price: order[3].toString(),
-        priceFormatted: ethers.formatUnits(order[3], 18),
-        isClaimTokenOrder: order[4],
-        isFillable,
-        tokens: {
-          collateralToken: collateralTokenAddr,
-          claimToken: claimTokenAddr
-        }
-      });
-    } catch (error) {
-      // Order doesn't exist or is already filled/cancelled
-      // Silent fail and move to the next ID
-    }
+    orderPromises.push(
+      orderbook.getOrder(orderId)
+        .then(order => ({ orderId, order, valid: order[2].toString() !== '0' }))
+        .catch(() => ({ orderId, valid: false }))
+    );
+  }
+  
+  // Wait for all order fetches to complete
+  const orderResults = await Promise.all(orderPromises);
+  const validOrders = orderResults.filter(result => result.valid);
+  
+  // Batch fetch fillable status for valid orders
+  const fillablePromises = validOrders.map(result => 
+    orderbook.isOrderFillable(result.orderId)
+      .then(isFillable => ({ ...result, isFillable }))
+      .catch(() => ({ ...result, isFillable: false }))
+  );
+  
+  const ordersWithFillable = await Promise.all(fillablePromises);
+  
+  // Batch fetch token addresses for unique strike prices
+  const uniqueStrikePrices = [...new Set(
+    ordersWithFillable.map(result => result.order[1].toString())
+  )];
+  
+  const tokenPromises = uniqueStrikePrices.map(strikePrice => 
+    insurancePool.getInsuranceTokens(strikePrice)
+      .then(tokens => ({ strikePrice, tokens }))
+      .catch(() => ({ strikePrice, tokens: [ethers.ZeroAddress, ethers.ZeroAddress] }))
+  );
+  
+  const tokenResults = await Promise.all(tokenPromises);
+  
+  // Build token cache
+  tokenResults.forEach(result => {
+    tokenCache[result.strikePrice] = {
+      collateralToken: result.tokens[0],
+      claimToken: result.tokens[1]
+    };
+  });
+  
+  // Format and return all order data
+  for (const result of ordersWithFillable) {
+    const { orderId, order, isFillable } = result;
+    const strikePrice = order[1].toString();
+    const tokens = tokenCache[strikePrice] || { 
+      collateralToken: ethers.ZeroAddress, 
+      claimToken: ethers.ZeroAddress 
+    };
+    
+    orders.push({
+      orderId,
+      maker: order[0],
+      strikePrice: strikePrice,
+      strikePriceFormatted: ethers.formatUnits(order[1], 18),
+      amount: order[2].toString(),
+      amountFormatted: ethers.formatUnits(order[2], 18),
+      price: order[3].toString(),
+      priceFormatted: ethers.formatUnits(order[3], 18),
+      isClaimTokenOrder: order[4],
+      isFillable,
+      tokens
+    });
   }
   
   return orders;
